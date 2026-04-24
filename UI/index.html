@@ -1,0 +1,107 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <meta name="description"
+    content="FireGuard — Real-time wearable firefighter monitoring dashboard tracking heat, air quality, humidity, and motion status." />
+  <title>FireGuard — Firefighter Safety Monitor</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link
+    href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800&family=Orbitron:wght@700;900&display=swap"
+    rel="stylesheet" />
+  <link rel="stylesheet" href="style.css" />
+</head>
+
+<body>
+
+  <!-- ALERT BANNER -->
+  <div id="alert-banner" class="alert-banner hidden">
+    <div class="alert-inner">
+      <span class="alert-icon">⚠️</span>
+      <span id="alert-text">CRITICAL ALERT: Dangerous conditions detected!</span>
+      <button onclick="dismissAlert()" class="alert-dismiss">DISMISS</button>
+    </div>
+  </div>
+
+  <!-- HEADER -->
+  <header class="header">
+    <div class="header-left">
+      <img src="logo.png" alt="FireGuard Logo" class="logo" />
+      <div>
+        <h1 class="brand">FireGuard<span class="brand-pro">PRO</span></h1>
+        <p class="brand-sub">Real-Time Firefighter Safety System</p>
+      </div>
+    </div>
+    <div class="header-right">
+      <button class="btn btn-primary" id="btn-connect-usb" onclick="connectUSB()" style="margin-right: 14px; background: linear-gradient(135deg, #00b4db, #0083b0); box-shadow: 0 4px 15px rgba(0,180,219,0.3);">🔌 Connect Arduino USB</button>
+      <div class="status-pill" id="connection-status">
+        <span class="dot pulse"></span> LIVE — Arduino BT Connected
+      </div>
+      <div class="header-time" id="header-time">--:--:--</div>
+    </div>
+  </header>
+
+  <!-- MAIN LAYOUT -->
+  <main class="main">
+
+    <!-- FIREFIGHTER ROSTER -->
+    <section class="section-title-row">
+      <h2 class="section-title">Active Units <span class="unit-count" id="unit-count">3</span></h2>
+      <div class="roster-controls">
+        <button class="btn btn-danger" onclick="triggerDrill()">🔥 Sensor Stress Test</button>
+      </div>
+    </section>
+
+    <!-- UNIT CARDS GRID -->
+    <div class="units-grid" id="units-grid"></div>
+
+    <!-- BOTTOM ROW: LOG + CHART -->
+    <div class="bottom-row">
+
+      <!-- ALERT LOG -->
+      <div class="card log-card">
+        <div class="card-header">
+          <h3>Alert Log</h3>
+          <button class="btn btn-ghost btn-sm" onclick="clearLog()">Clear</button>
+        </div>
+        <div class="log-list" id="log-list">
+          <div class="log-empty">No alerts recorded. System nominal.</div>
+        </div>
+      </div>
+
+      <!-- LIVE CHART -->
+      <div class="card chart-card">
+        <div class="card-header">
+          <h3>Live Sensor History</h3>
+          <select class="select-unit" id="chart-unit-select" onchange="changeChartUnit(this.value)">
+            <option value="0">Live Arduino Feed</option>
+            <option value="1">FF-002 – Chen (Sim)</option>
+            <option value="2">FF-003 – Patel (Sim)</option>
+          </select>
+        </div>
+        <canvas id="sensor-chart" width="600" height="220"></canvas>
+        <div class="chart-legend">
+          <span class="legend-dot temp"></span> Temperature (°F)
+          <span class="legend-dot aq"></span> CO2 (ppm)
+          <span class="legend-dot hr"></span> Ammonia NH3 (ppm)
+        </div>
+      </div>
+
+    </div>
+
+  </main>
+
+  <!-- UNIT DETAIL MODAL -->
+  <div class="modal-overlay hidden" id="modal-overlay" onclick="closeModal(event)">
+    <div class="modal" id="unit-modal">
+      <button class="modal-close" onclick="closeModal()">✕</button>
+      <div id="modal-content"></div>
+    </div>
+  </div>
+
+  <script src="app.js"></script>
+</body>
+
+</html>

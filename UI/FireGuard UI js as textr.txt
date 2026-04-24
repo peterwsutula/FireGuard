@@ -1,0 +1,731 @@
+/* =====================================================
+   FireGuard PRO — app.js
+   Auto-detects PC bridge (localhost:8080) for live
+   Arduino data. Falls back to simulation if offline.
+   ===================================================== */
+
+// ── Bridge Config ──────────────────────────────────────
+const BRIDGE_URL  = 'http://localhost:8080/data';
+const LIVE_POLL_MS = 2000;   // fetch every 2 seconds
+let   liveMode    = false;   // true once bridge is detected
+
+// ── Initial firefighter units ──────────────────────────
+const UNIT_TEMPLATES = [
+  { id: 'FF-001', name: 'Live Arduino Feed', role: 'Wearable Unit', avatar: '🧑‍🚒' },
+  { id: 'FF-002', name: 'Chen, R.', role: 'Search & Rescue (Sim)', avatar: '👨‍🚒' },
+  { id: 'FF-003', name: 'Patel, A.', role: 'Support (Sim)', avatar: '👩‍🚒' },
+];
+
+// ── Thresholds ─────────────────────────────────────────
+const THRESHOLDS = {
+  temp:    { safe: 120,  warning: 160 },
+  co2:     { safe: 1000, warning: 2000 },
+  nh4:     { safe: 10,   warning: 25 },
+  nh3:     { safe: 25,   warning: 50 },
+  toluene: { safe: 50,   warning: 100 }
+};
+
+// ── Sensor history for chart (last 20 readings) ────────
+const HISTORY_LEN = 20;
+let sensorHistory = [];    // array of { temp, aqi, hr }[] per unit
+
+// ── State ──────────────────────────────────────────────
+let units = [];
+let activeAlerts = new Set();
+let chartUnitIdx = 0;
+let chartCanvas, ctx;
+let drillActive = false;
+
+// ── Bootstrap ──────────────────────────────────────────
+window.addEventListener('DOMContentLoaded', () => {
+  chartCanvas = document.getElementById('sensor-chart');
+  ctx         = chartCanvas.getContext('2d');
+
+  UNIT_TEMPLATES.forEach((t, i) => {
+    units.push(createUnit(t, i));
+    sensorHistory.push([]);
+  });
+
+  renderAllCards();
+  startClock();
+
+  // Try to connect to the PC bridge first
+  detectBridge().then(connected => {
+    if (connected) {
+      setLiveMode(true);
+      startLiveTicker();
+      addLog('info', 'System', '🟢 LIVE MODE — Arduino RF data connected via bridge.');
+    } else {
+      setLiveMode(false);
+      startSimTicker();
+      addLog('info', 'System', 'FireGuard PRO initialized in simulation mode.');
+      addLog('info', 'System', 'Start bridge/server.js to connect real Arduino data.');
+    }
+  });
+});
+
+// ── Bridge detection ────────────────────────────────────
+async function detectBridge() {
+  try {
+    const res = await fetch(BRIDGE_URL, { signal: AbortSignal.timeout(1500) });
+    if (!res.ok) return false;
+    const data = await res.json();
+    return data.connected === true;
+  } catch {
+    return false;
+  }
+}
+
+// ── Update header status pill ───────────────────────────
+function setLiveMode(live) {
+  liveMode = live;
+  const pill = document.getElementById('connection-status');
+  if (live) {
+    pill.style.background = 'rgba(34,197,94,0.12)';
+    pill.style.border     = '1px solid rgba(34,197,94,0.3)';
+    pill.style.color      = '#22c55e';
+    pill.innerHTML        = '<span class="dot pulse"></span> LIVE — Arduino RF Connected';
+  } else {
+    pill.style.background = 'rgba(99,102,241,0.12)';
+    pill.style.border     = '1px solid rgba(99,102,241,0.3)';
+    pill.style.color      = '#818cf8';
+    pill.innerHTML        = '<span class="dot" style="background:#818cf8"></span> SIM MODE — No Bridge Detected';
+  }
+}
+
+// ── Create unit object ─────────────────────────────────
+function createUnit(template, idx) {
+  return {
+    ...template,
+    temp:         randomBase(75, 10),
+    co2:          randomBase(400, 100),
+    nh4:          randomBase(0.5, 0.5),
+    nh3:          randomBase(0.2, 0.2),
+    toluene:      randomBase(0.1, 0.1),
+    moving:       true,
+    stillSeconds: 0,
+    mayday:       false,
+    status:       'safe',
+  };
+}
+
+// ── MAYDAY state ────────────────────────────────────────
+let maydayShowing = false;
+let alarmOsc      = null;
+let alarmCtx      = null;
+
+// ── Random base with variance ──────────────────────────
+function randomBase(base, variance) {
+  return +(base + (Math.random() - 0.5) * variance).toFixed(1);
+}
+
+// ── Simulation ticker ──────────────────────────────────
+let simInterval = null;
+let liveInterval = null;
+
+function startSimTicker() {
+  if (simInterval) clearInterval(simInterval);
+  simInterval = setInterval(() => {
+    updateSensors();
+    renderAllCards();
+    updateChart();
+    checkAlerts();
+  }, LIVE_POLL_MS);
+}
+
+// ── Live ticker: poll bridge, handle motion/MAYDAY ──────
+function startLiveTicker() {
+  if (liveInterval) clearInterval(liveInterval);
+  liveInterval = setInterval(async () => {
+    try {
+      const res  = await fetch(BRIDGE_URL, { signal: AbortSignal.timeout(1500) });
+      const data = await res.json();
+
+      if (data.connected) {
+        // Apply real data from Uno -> Mega -> Bridge
+        const u        = units[0];
+        u.moving       = data.moving;
+        u.stillSeconds = data.still_seconds || 0;
+        u.mayday       = data.mayday;
+        u.temp         = data.temp || 0;
+        u.co2          = data.co2 || 0;
+        u.nh4          = data.nh4 || 0;
+        u.nh3          = data.nh3 || 0;
+        u.toluene      = data.toluene || 0;
+        u.status       = data.mayday ? 'danger' : (data.moving ? 'safe' : 'warning');
+
+        // History for chart (mapping to generic temp/aqi/hr channels)
+        const hist = sensorHistory[0];
+        hist.push({ temp: u.temp, aqi: u.co2, hr: u.nh3 }); 
+        if (hist.length > HISTORY_LEN) hist.shift();
+
+        // Trigger MAYDAY overlay
+        if (data.mayday && !maydayShowing) triggerMayday(u, data.still_seconds);
+        if (!data.mayday && maydayShowing)  cancelMayday(u);
+      } else {
+        updateSensors();
+      }
+    } catch {
+      updateSensors();
+      if (liveMode) {
+        setLiveMode(false);
+        addLog('warning', 'System', '⚠️ Bridge disconnected — switched to simulation mode.');
+      }
+    }
+    renderAllCards();
+    updateChart();
+    checkAlerts();
+  }, LIVE_POLL_MS);
+}
+
+// ── MAYDAY Overlay ───────────────────────────────────────
+function triggerMayday(u, secs) {
+  maydayShowing = true;
+  addLog('danger', u.name, `🚨 FIREFIGHTER DOWN — No motion for ${secs}s. Authorities alerted!`);
+
+  // Inject overlay if not already present
+  if (!document.getElementById('mayday-overlay')) {
+    const el = document.createElement('div');
+    el.id = 'mayday-overlay';
+    el.innerHTML = `
+      <div class="mayday-box">
+        <div class="mayday-icon">🚨</div>
+        <h2 class="mayday-title">FIREFIGHTER DOWN</h2>
+        <p class="mayday-unit">${u.name} — ${u.id}</p>
+        <p class="mayday-msg">No motion detected for <span id="mayday-secs">${secs}</span> seconds.<br>Authorities have been alerted. Dispatching rescue team.</p>
+        <div class="mayday-actions">
+          <button onclick="cancelMayday()" class="mayday-btn-cancel">✅ Unit Recovered</button>
+          <button onclick="callEmergency()" class="mayday-btn-call">📞 Call 911</button>
+        </div>
+      </div>`;
+    document.body.appendChild(el);
+  }
+
+  document.getElementById('mayday-overlay').classList.remove('hidden');
+  playAlarm();
+  showBanner(`🚨 MAYDAY: ${u.name} (${u.id}) NO MOTION FOR ${secs}s — FIREFIGHTER DOWN`);
+}
+
+function cancelMayday(u) {
+  maydayShowing = false;
+  stopAlarm();
+  const el = document.getElementById('mayday-overlay');
+  if (el) el.classList.add('hidden');
+  if (u) addLog('info', u.name, '✅ Motion resumed — MAYDAY cancelled.');
+}
+
+function callEmergency() {
+  addLog('danger', 'Command', '📞 Emergency services contacted — rescue dispatched.');
+  alert('Emergency services have been notified. Stay on the line.');
+}
+
+// ── Web Audio alarm ──────────────────────────────────────
+function playAlarm() {
+  try {
+    alarmCtx = new (window.AudioContext || window.webkitAudioContext)();
+    function beep() {
+      if (!alarmCtx || alarmCtx.state === 'closed') return;
+      const osc  = alarmCtx.createOscillator();
+      const gain = alarmCtx.createGain();
+      osc.connect(gain);
+      gain.connect(alarmCtx.destination);
+      osc.type      = 'square';
+      osc.frequency.setValueAtTime(880, alarmCtx.currentTime);
+      osc.frequency.setValueAtTime(660, alarmCtx.currentTime + 0.2);
+      gain.gain.setValueAtTime(0.3, alarmCtx.currentTime);
+      gain.gain.exponentialRampToValueAtTime(0.001, alarmCtx.currentTime + 0.4);
+      osc.start();
+      osc.stop(alarmCtx.currentTime + 0.4);
+    }
+    beep();
+    alarmOsc = setInterval(beep, 800);
+  } catch(e) { /* audio blocked — user hasn't interacted yet */ }
+}
+
+function stopAlarm() {
+  if (alarmOsc)  { clearInterval(alarmOsc); alarmOsc = null; }
+  if (alarmCtx)  { alarmCtx.close(); alarmCtx = null; }
+}
+
+// ── Simulate all units ─────────────────────────────────
+function updateSensors() {
+  units.forEach((_, i) => {
+    // If liveMode is true, DO NOT simulate the Live Arduino (index 0)
+    if (liveMode && i === 0) return;
+    simulateUnit(i);
+  });
+}
+
+function simulateUnit(i) {
+  const u = units[i];
+  if (drillActive) {
+    u.temp = Math.min(250, u.temp + rnd(4, 12));
+    u.co2  = Math.min(4000, u.co2  + rnd(50, 150));
+    u.nh4  = Math.min(50,  u.nh4  + rnd(1, 4));
+    u.nh3  = Math.min(100, u.nh3  + rnd(2, 6));
+    u.toluene = Math.min(200, u.toluene + rnd(5, 10));
+  } else {
+    u.temp = clamp(u.temp + rnd(-1.5, 1.5), 65, 180);
+    u.co2  = clamp(u.co2  + rnd(-10,   10), 400, 1500);
+    u.nh4  = clamp(u.nh4  + rnd(-0.2, 0.2), 0, 20);
+    u.nh3  = clamp(u.nh3  + rnd(-0.2, 0.4), 0, 30);
+    u.toluene = clamp(u.toluene + rnd(-0.5, 1.0), 0, 50);
+  }
+  u.temp    = +u.temp.toFixed(1);
+  u.co2     = +u.co2.toFixed(0);
+  u.nh4     = +u.nh4.toFixed(1);
+  u.nh3     = +u.nh3.toFixed(1);
+  u.toluene = +u.toluene.toFixed(1);
+  u.status  = calcStatus(u);
+
+  const hist = sensorHistory[i];
+  hist.push({ temp: u.temp, aqi: u.co2, hr: u.nh3 });
+  if (hist.length > HISTORY_LEN) hist.shift();
+}
+
+function rnd(min, max) {
+  return Math.random() * (max - min) + min;
+}
+function clamp(v, min, max) {
+  return Math.max(min, Math.min(max, v));
+}
+
+// ── Compute unit status ────────────────────────────────
+function calcStatus(u) {
+  if (
+    u.temp > THRESHOLDS.temp.warning ||
+    u.co2  > THRESHOLDS.co2.warning  ||
+    u.nh4  > THRESHOLDS.nh4.warning  ||
+    u.nh3  > THRESHOLDS.nh3.warning  ||
+    u.toluene > THRESHOLDS.toluene.warning
+  ) return 'danger';
+
+  if (
+    u.temp > THRESHOLDS.temp.safe ||
+    u.co2  > THRESHOLDS.co2.safe  ||
+    u.nh4  > THRESHOLDS.nh4.safe  ||
+    u.nh3  > THRESHOLDS.nh3.safe  ||
+    u.toluene > THRESHOLDS.toluene.safe
+  ) return 'warning';
+
+  return 'safe';
+}
+
+// ── Determine reading class ────────────────────────────
+function readingClass(val, type) {
+  if (val > THRESHOLDS[type].warning) return 'danger';
+  if (val > THRESHOLDS[type].safe)    return 'warning';
+  return 'safe';
+}
+
+// ── Bar fill %  ────────────────────────────────────────
+function barPct(val, type) {
+  const maxes = { temp: 250, co2: 3000, nh4: 50, nh3: 100, toluene: 200 };
+  return Math.min(100, (val / maxes[type]) * 100).toFixed(1);
+}
+
+// ── Render all unit cards ──────────────────────────────
+function renderAllCards() {
+  const grid = document.getElementById('units-grid');
+  grid.innerHTML = '';
+  units.forEach((u, i) => {
+    grid.appendChild(buildCard(u, i));
+  });
+  document.getElementById('unit-count').textContent = units.length;
+}
+
+// ── Build a single card element ────────────────────────
+function buildCard(u, idx) {
+  const card = document.createElement('div');
+  card.className = `unit-card status-${u.status}`;
+  card.id = `card-${idx}`;
+  card.onclick = () => openModal(idx);
+
+  const tClass = readingClass(u.temp, 'temp');
+  const cClass = readingClass(u.co2,  'co2');
+  const nClass = readingClass(u.nh3,  'nh3');
+  // Motion Logic
+  const mStatus = u.mayday ? '🚨 MAYDAY' : (u.moving ? '🟢 MOVING' : `🟡 STILL (${u.stillSeconds}s)`);
+  const mClass  = u.mayday ? 'danger' : (u.moving ? 'safe' : 'warning');
+
+  card.innerHTML = `
+    <div class="unit-top">
+      <div class="unit-identity">
+        <div class="unit-avatar">${u.avatar}</div>
+        <div>
+          <div class="unit-name">${u.name}</div>
+          <div class="unit-id">${u.id} · ${u.role}</div>
+        </div>
+      </div>
+      <div class="status-badge badge-${u.status}">${u.status.toUpperCase()}</div>
+    </div>
+
+    <div class="sensor-rows">
+      ${sensorRow('🏃', 'Motion Status', mStatus, mClass, u.moving ? 100 : 30)}
+      ${sensorRow('🌡️', 'Temperature', u.temp + ' °F', tClass, barPct(u.temp, 'temp'))}
+      ${sensorRow('💨', 'CO2 Level', u.co2 + ' ppm', cClass, barPct(u.co2, 'co2'))}
+      ${sensorRow('☣️', 'Ammonia (NH3)', u.nh3 + ' ppm', nClass, barPct(u.nh3, 'nh3'))}
+    </div>
+  `;
+  return card;
+}
+
+function sensorRow(icon, label, value, cls, pct) {
+  return `
+    <div class="sensor-row">
+      <div class="sensor-icon">${icon}</div>
+      <div class="sensor-info">
+        <div class="sensor-label">${label}</div>
+        <div class="sensor-value ${cls}">${value}</div>
+        <div class="sensor-bar-track">
+          <div class="sensor-bar-fill bar-${cls}" style="width:${pct}%"></div>
+        </div>
+      </div>
+    </div>`;
+}
+
+// ── Alert checking ─────────────────────────────────────
+function checkAlerts() {
+  let anyDanger = false;
+  units.forEach((u, i) => {
+    const key = `danger-${i}`;
+    if (u.status === 'danger' && !activeAlerts.has(key)) {
+      activeAlerts.add(key);
+      anyDanger = true;
+      addLog('danger', u.name, buildAlertMsg(u));
+      showBanner(`🚨 DANGER: ${u.name} (${u.id}) — ${buildAlertMsg(u)}`);
+    } else if (u.status !== 'danger') {
+      activeAlerts.delete(key);
+    }
+
+    const wkey = `warn-${i}`;
+    if (u.status === 'warning' && !activeAlerts.has(wkey)) {
+      activeAlerts.add(wkey);
+      addLog('warning', u.name, `Elevated readings detected. Monitor situation.`);
+    } else if (u.status === 'safe') {
+      activeAlerts.delete(wkey);
+    }
+  });
+}
+
+function buildAlertMsg(u) {
+  const parts = [];
+  if (u.temp > THRESHOLDS.temp.warning) parts.push(`Temp ${u.temp}°F`);
+  if (u.co2  > THRESHOLDS.co2.warning)  parts.push(`CO2 ${u.co2}`);
+  if (u.nh3  > THRESHOLDS.nh3.warning)  parts.push(`NH3 ${u.nh3}`);
+  if (u.toluene > THRESHOLDS.toluene.warning) parts.push(`Toluene ${u.toluene}`);
+  return parts.join(', ') + ' — Immediate extraction advised!';
+}
+
+// ── Alert Banner ───────────────────────────────────────
+function showBanner(msg) {
+  const banner = document.getElementById('alert-banner');
+  document.getElementById('alert-text').textContent = msg;
+  banner.classList.remove('hidden');
+  // auto-dismiss after 8s if still shown
+  clearTimeout(showBanner._timer);
+  showBanner._timer = setTimeout(() => banner.classList.add('hidden'), 8000);
+}
+function dismissAlert() {
+  document.getElementById('alert-banner').classList.add('hidden');
+}
+
+// ── Alert Log ──────────────────────────────────────────
+function addLog(type, source, msg) {
+  const list = document.getElementById('log-list');
+  const empty = list.querySelector('.log-empty');
+  if (empty) empty.remove();
+
+  const now = new Date();
+  const time = now.toLocaleTimeString('en-US', { hour12: false });
+
+  const entry = document.createElement('div');
+  entry.className = `log-entry log-${type}`;
+  entry.innerHTML = `
+    <span class="log-time">${time}</span>
+    <span class="log-msg"><strong>${source}:</strong> ${msg}</span>
+  `;
+  list.prepend(entry);
+
+  // Keep max 40 entries
+  while (list.children.length > 40) list.lastChild.remove();
+}
+
+function clearLog() {
+  const list = document.getElementById('log-list');
+  list.innerHTML = '<div class="log-empty">Log cleared.</div>';
+  activeAlerts.clear();
+}
+
+// ── Live Chart (vanilla canvas) ───────────────────────
+function updateChart() {
+  const hist = sensorHistory[chartUnitIdx] || [];
+  if (hist.length < 2) return;
+
+  const W = chartCanvas.offsetWidth;
+  const H = 220;
+  chartCanvas.width  = W;
+  chartCanvas.height = H;
+
+  ctx.clearRect(0, 0, W, H);
+  drawGridLines(W, H);
+
+  // Normalise each series to 0–1 using fixed max ranges
+  const maxes = { temp: 120, aqi: 3000, hr: 100 }; // HR slot is used for NH3
+  drawLine(hist.map(d => d.temp / maxes.temp), '#ff5500', W, H);
+  drawLine(hist.map(d => d.aqi  / maxes.aqi),  '#3b82f6', W, H);
+  drawLine(hist.map(d => d.hr   / maxes.hr),   '#22c55e', W, H);
+}
+
+function drawGridLines(W, H) {
+  ctx.strokeStyle = 'rgba(42,48,80,0.7)';
+  ctx.lineWidth   = 1;
+  for (let i = 1; i < 4; i++) {
+    const y = (H / 4) * i;
+    ctx.beginPath();
+    ctx.moveTo(0, y);
+    ctx.lineTo(W, y);
+    ctx.stroke();
+  }
+}
+
+function drawLine(normData, color, W, H) {
+  if (normData.length < 2) return;
+  const PAD = 10;
+  const plotH = H - PAD * 2;
+  const step  = (W - PAD * 2) / (HISTORY_LEN - 1);
+
+  ctx.beginPath();
+  ctx.strokeStyle = color;
+  ctx.lineWidth   = 2.5;
+  ctx.lineJoin    = 'round';
+  ctx.lineCap     = 'round';
+
+  // Gradient fill
+  const grad = ctx.createLinearGradient(0, 0, 0, H);
+  grad.addColorStop(0,   color + '44');
+  grad.addColorStop(1,   color + '00');
+
+  normData.forEach((v, i) => {
+    const offset = HISTORY_LEN - normData.length;
+    const x = PAD + (i + offset) * step;
+    const y = PAD + plotH - v * plotH;
+    if (i === 0) ctx.moveTo(x, y);
+    else ctx.lineTo(x, y);
+  });
+  ctx.stroke();
+}
+
+function changeChartUnit(val) {
+  chartUnitIdx = parseInt(val, 10);
+  updateChart();
+}
+
+// ── Drill / Alert Simulation ───────────────────────────
+function triggerDrill() {
+  if (drillActive) {
+    drillActive = false;
+    // Reset to safer values gradually
+    units.forEach(u => {
+      u.temp    = randomBase(25, 5);
+      u.co2     = randomBase(400, 50);
+      u.nh4     = randomBase(0.5, 0.2);
+      u.nh3     = randomBase(0.2, 0.2);
+      u.toluene = randomBase(0.1, 0.1);
+    });
+    addLog('info', 'System', '⚡ DRILL ENDED — System returning to normal.');
+    return;
+  }
+  drillActive = true;
+  addLog('danger', 'System', '🔥 FIRE SCENARIO INITIATED — Sensors spiking. Monitor all units!');
+  showBanner('🔥 DRILL ACTIVE — Fire scenario initiated. All units at risk!');
+}
+
+// ── Clock ──────────────────────────────────────────────
+function startClock() {
+  const el = document.getElementById('header-time');
+  const tick = () => {
+    const now = new Date();
+    el.textContent = now.toLocaleTimeString('en-US', { hour12: false });
+  };
+  tick();
+  setInterval(tick, 1000);
+}
+
+// ── Modal ──────────────────────────────────────────────
+function openModal(idx) {
+  const u = units[idx];
+  const tC = readingClass(u.temp, 'temp');
+  const cC = readingClass(u.co2,  'co2');
+  const nC = readingClass(u.nh3,  'nh3');
+  const nh4C = readingClass(u.nh4, 'nh4');
+  const tolC = readingClass(u.toluene, 'toluene');
+
+  const statusLabel = {
+    safe:    { color: '#22c55e', txt: '✅ Within Safe Limits' },
+    warning: { color: '#facc15', txt: '⚠️ Elevated — Monitor Closely' },
+    danger:  { color: '#ef4444', txt: '🚨 DANGER — Immediate Action Required' },
+  }[u.status];
+
+  document.getElementById('modal-content').innerHTML = `
+    <div class="modal-unit-name">${u.name}</div>
+    <div class="modal-unit-role">${u.id} · ${u.role}</div>
+    <div class="modal-sensors">
+      ${modalSensor('🏃', 'Motion Status', u.mayday ? 'MAYDAY' : (u.moving ? 'MOVING' : 'STILL'), u.mayday ? 'danger' : 'safe', u.stillSeconds + 's total')}
+      ${modalSensor('🌡️', 'Temperature', u.temp + ' °F', tC, tempInfo(u.temp))}
+      ${modalSensor('💨', 'CO2 Level', u.co2 + ' ppm', cC, aqiInfo(u.co2))}
+      ${modalSensor('🧪', 'NH4', u.nh4 + ' ppm', nh4C, 'Ammonium Level')}
+      ${modalSensor('☣️', 'Ammonia (NH3)', u.nh3 + ' ppm', nC, 'Ammonia Level')}
+      ${modalSensor('⛽', 'Toluene', u.toluene + ' ppm', tolC, 'Toluene Level')}
+    </div>
+    <p style="font-size:0.82rem;font-weight:700;color:${statusLabel.color};margin-bottom:18px;">
+      ${statusLabel.txt}
+    </p>
+    <div class="modal-actions">
+      <button class="btn-primary" onclick="closeModal()">Close</button>
+      <button class="btn btn-ghost" onclick="closeModal();addLog('info','${u.name}','Manual check initiated by command.')">
+        📡 Signal Unit
+      </button>
+    </div>
+  `;
+  document.getElementById('modal-overlay').classList.remove('hidden');
+}
+
+function modalSensor(icon, label, value, cls, info) {
+  return `
+    <div class="modal-sensor">
+      <div class="modal-sensor-icon">${icon}</div>
+      <div class="modal-sensor-body">
+        <div class="modal-sensor-label">${label}</div>
+        <div class="modal-sensor-value ${cls}">${value}</div>
+        <div class="modal-sensor-status" style="color:var(--${cls === 'safe' ? 'green' : cls === 'warning' ? 'yellow' : 'red'})">${info}</div>
+      </div>
+    </div>`;
+}
+
+function tempInfo(v) {
+  if (v > THRESHOLDS.temp.warning) return '🔴 Critical heat exposure';
+  if (v > THRESHOLDS.temp.safe)    return '🟡 Elevated — approaching threshold';
+  return '🟢 Safe range';
+}
+function aqiInfo(v) {
+  if (v > THRESHOLDS.aqi.warning) return '🔴 Hazardous — toxic gas detected';
+  if (v > THRESHOLDS.aqi.safe)    return '🟡 Unhealthy — limited exposure';
+  return '🟢 Air quality acceptable';
+}
+function hrInfo(v) {
+  if (v > THRESHOLDS.hr.warning) return '🔴 Tachycardia — possible distress';
+  if (v > THRESHOLDS.hr.safe)    return '🟡 Elevated heart rate';
+  return '🟢 Normal range';
+}
+
+function closeModal(e) {
+  if (e && e.target !== document.getElementById('modal-overlay')) return;
+  document.getElementById('modal-overlay').classList.add('hidden');
+}
+
+// ============================================================================
+// ── WEB SERIAL API: DIRECT USB CONNECTION (NO NODE.JS REQUIRED) ─────────────
+// ============================================================================
+
+let serialPort   = null;
+let serialReader = null;
+
+async function connectUSB() {
+  try {
+    // Prompt user to select the Arduino COM port
+    serialPort = await navigator.serial.requestPort();
+    await serialPort.open({ baudRate: 9600 });
+    
+    // Hide the connect button and switch UI to LIVE mode
+    document.getElementById('btn-connect-usb').style.display = 'none';
+    setLiveMode(true);
+    addLog('info', 'System', '🔌 USB Connected! Direct serial data link established.');
+    
+    // Stop simulation tracking so direct data isn't overwritten
+    if (simInterval) clearInterval(simInterval);
+    if (liveInterval) clearInterval(liveInterval);
+    
+    // Start the endless reading loop
+    readSerialLoop();
+  } catch (e) {
+    addLog('danger', 'System', 'USB Connection failed or cancelled. Make sure no other program (like Arduino IDE) is using the port.');
+    console.error(e);
+  }
+}
+
+async function readSerialLoop() {
+  const decoder     = new TextDecoderStream();
+  const inputDone   = serialPort.readable.pipeTo(decoder.writable);
+  const inputStream = decoder.readable;
+  serialReader      = inputStream.getReader();
+  
+  let buffer = '';
+  
+  while (true) {
+    const { value, done } = await serialReader.read();
+    if (done) {
+      serialReader.releaseLock();
+      break;
+    }
+    if (value) {
+      buffer += value;
+      let lines = buffer.split('\n');
+      buffer = lines.pop(); // Keep the unfinished line in buffer
+      
+      for (let line of lines) {
+        processSerialLine(line.trim());
+      }
+    }
+  }
+}
+
+function processSerialLine(line) {
+  if (!line) return;
+  
+  const prefix = "Data Received: ";
+  if (line.includes(prefix)) {
+    const csv = line.substring(line.indexOf(prefix) + prefix.length);
+    const parts = csv.split(',');
+    
+    // Ensure we got at least Temp, isMoving, CO2, NH4, NH3, Toluene
+    if (parts.length >= 6) {
+      const u = units[0]; // Apply strictly to Unit 1
+      
+      u.temp    = parseFloat(parts[0]);
+      let isMv  = (parts[1] === '1' || parts[1] === 'true');
+      u.co2     = parseFloat(parts[2]);
+      u.nh4     = parseFloat(parts[3]);
+      u.nh3     = parseFloat(parts[4]);
+      u.toluene = parseFloat(parts[5]);
+      
+      u.moving = isMv;
+      
+      // Calculate MAYDAY logic natively in the browser
+      if (isMv) {
+        u.stillSeconds = 0;
+        u.mayday = false;
+        if (maydayShowing) cancelMayday(u);
+      } else {
+        u.stillSeconds += 2; // Approximating ~2 seconds per transmission interval
+        if (u.stillSeconds >= 20) {
+          u.mayday = true;
+          if (!maydayShowing) triggerMayday(u, u.stillSeconds);
+        }
+      }
+      
+      u.status = calcStatus(u);
+      
+      // Push history and re-render
+      const hist = sensorHistory[0];
+      hist.push({ temp: u.temp, aqi: u.co2, hr: u.nh3 });
+      if (hist.length > HISTORY_LEN) hist.shift();
+      
+      renderAllCards();
+      updateChart();
+      checkAlerts();
+    }
+  } else if (line.includes("Fireguard Receiver")) {
+    setLiveMode(true);
+  }
+}
