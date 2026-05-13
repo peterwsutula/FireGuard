@@ -1,0 +1,14 @@
+{
+  "name": "fireguard-bridge",
+  "version": "1.0.0",
+  "description": "Serial-to-HTTP bridge for FireGuard PRO dashboard",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "serialport": "^12.0.0",
+    "express": "^4.18.2",
+    "cors": "^2.8.5"
+  }
+}
